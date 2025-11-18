@@ -1,0 +1,550 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Doom-lite — Full Features</title>
+</head>
+<body style="margin:0; background:#000; color:#ddd; font-family:Segoe UI, Roboto, system-ui;">
+<!-- Canvas -->
+<canvas id="game" width="1000" height="600" style="display:block; margin:0 auto; background:#111;"></canvas>
+
+<!-- Crosshair -->
+<div id="crosshair" style="
+    position:fixed;
+    left:50%;
+    top:50%;
+    width:10px;
+    height:10px;
+    background:transparent;
+    border:2px solid rgba(255,255,255,0.9);
+    border-radius:50%;
+    margin-left:-5px;
+    margin-top:-5px;
+    z-index:10;"></div>
+
+<!-- HUD -->
+<div id="hud" style="position:fixed; left:12px; top:12px; z-index:12; color:#fff;">
+  <div id="score" style="font-weight:700">Score: 0</div>
+  <div id="health" style="margin-top:6px;">Health: <span id="hpVal">100</span></div>
+  <div style="margin-top:6px;">
+    <small>W/S: forward/back • A/D: turn • Space: shoot • M: mute</small>
+  </div>
+</div>
+
+<script>
+/* Doom-lite Full — single-file
+   - player movement in a continuous 2D plane
+   - enemies spawn every 10s at random spawn points
+   - different enemy types (hp, speed, size, color, score)
+   - shoot with space -> damages closest enemy in crosshair
+   - gun animation & simple muzzle flash
+   - sounds via WebAudio
+*/
+
+// ---------- Canvas ----------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// responsive sizing (keeps aspect ratio)
+function fitCanvas() {
+  const margin = 0;
+  const W = Math.min(window.innerWidth - margin, 1200);
+  const H = Math.min(window.innerHeight - margin - 10, 800);
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', fitCanvas);
+fitCanvas();
+
+// ---------- Game state ----------
+let player = {
+  x: 5.0, y: 5.0,          // world units
+  dir: 0,                  // radians
+  fov: Math.PI / 3,
+  speed: 3.0,              // units / sec
+  hp: 100,
+  alive: true
+};
+
+let keys = {};
+document.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; });
+document.addEventListener('keyup',   e => { keys[e.key.toLowerCase()] = false; });
+
+let enemies = [];
+let score = 0;
+let lastSpawnTime = performance.now();
+const SPAWN_INTERVAL = 10000; // 10 seconds
+let isMuted = false;
+document.addEventListener('keydown', e => { if (e.key.toLowerCase() === 'm') isMuted = !isMuted; });
+
+// ---------- Spawn locations (world coordinates) ----------
+const SPAWN_POINTS = [
+  {x: 12, y: 2},
+  {x: 2, y: 12},
+  {x: 18, y: 10},
+  {x: 20, y: 4},
+  {x: 4, y: 20},
+  {x: 14, y: 18}
+];
+
+// ---------- Enemy types ----------
+const ENEMY_TYPES = {
+  grunt:  { hp: 20, speed: 1.2, size: 0.9, color: '#ffd07a', score: 25, damage: 8 },
+  runner: { hp: 10, speed: 2.4, size: 0.6, color: '#ff8a8a', score: 30, damage: 6 },
+  tank:   { hp: 50, speed: 0.8, size: 1.6, color: '#8ad1ff', score: 75, damage: 18 }
+};
+
+// pick random type with probabilities
+function randomEnemyType() {
+  const r = Math.random();
+  if (r < 0.55) return 'grunt';
+  if (r < 0.85) return 'runner';
+  return 'tank';
+}
+
+// ---------- WebAudio simple sounds ----------
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playBeep({freq=440, type='sine', dur=0.08, vol=0.12, ramp=0.01} = {}) {
+  if (isMuted) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  g.gain.linearRampToValueAtTime(vol, audioCtx.currentTime + ramp);
+  g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + dur + 0.02);
+}
+
+// special sounds
+function playShootSound() {
+  playBeep({freq: 1200, type:'square', dur:0.06, vol:0.12, ramp:0.002});
+  // a second lower sub-bass pop
+  setTimeout(()=>playBeep({freq:220, type:'sine', dur:0.09, vol:0.08}), 10);
+}
+function playHitSound() {
+  playBeep({freq:700, type:'sawtooth', dur:0.09, vol:0.08});
+}
+function playKillSound() {
+  playBeep({freq:320, type:'triangle', dur:0.18, vol:0.14});
+  setTimeout(()=>playBeep({freq:480, type:'sine', dur:0.12, vol:0.09}), 60);
+}
+function playPlayerHitSound() {
+  playBeep({freq:140, type:'sine', dur:0.12, vol:0.14});
+}
+
+// ---------- Gun animation ----------
+let gun = {
+  recoil: 0,         // frames of recoil left (0 = idle). We'll animate using 0..1
+  lastShotTime: 0,
+  muzzleFlash: 0
+};
+
+function shoot() {
+  if (!player.alive) return;
+  const now = performance.now();
+  // rate-limit: 200ms between shots
+  if (now - gun.lastShotTime < 160) return;
+  gun.lastShotTime = now;
+  gun.recoil = 1.0;        // start recoil (will decay)
+  gun.muzzleFlash = 1.0;
+
+  playShootSound();
+
+  // find best enemy within aim cone and range
+  const aimTolerance = 0.12;  // radians (~7 deg)
+  const maxRange = 18;        // world units
+  let best = null;
+  let bestAng = 999;
+  for (let e of enemies) {
+    if (!e.alive) continue;
+    const dx = e.x - player.x;
+    const dy = e.y - player.y;
+    const dist = Math.hypot(dx,dy);
+    if (dist > maxRange) continue;
+    let ang = Math.atan2(dy, dx) - player.dir;
+    // normalize
+    while (ang < -Math.PI) ang += Math.PI*2;
+    while (ang > Math.PI) ang -= Math.PI*2;
+    if (Math.abs(ang) <= aimTolerance) {
+      if (Math.abs(ang) < bestAng) { bestAng = Math.abs(ang); best = e; }
+    }
+  }
+
+  // if anything hit, damage it
+  if (best) {
+    // damage amount varies slightly
+    const dmg = 12 + Math.round(Math.random()*6);
+    best.hp -= dmg;
+    playHitSound();
+    if (best.hp <= 0) {
+      best.alive = false;
+      score += best.value;
+      playKillSound();
+    }
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    // ensure audio context resumed on first user gesture (needed on some browsers)
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    shoot();
+  }
+});
+
+// ---------- Enemy spawn ----------
+function spawnOne() {
+  const sp = SPAWN_POINTS[Math.floor(Math.random()*SPAWN_POINTS.length)];
+  const t = randomEnemyType();
+  const def = ENEMY_TYPES[t];
+  enemies.push({
+    x: sp.x + (Math.random()*0.6 - 0.3),  // slight jitter
+    y: sp.y + (Math.random()*0.6 - 0.3),
+    type: t,
+    hp: def.hp,
+    maxHp: def.hp,
+    speed: def.speed,
+    size: def.size,
+    color: def.color,
+    value: def.score,
+    damage: def.damage,
+    alive: true
+  });
+}
+
+// initial spawn
+spawnOne();
+// spawn periodically
+setInterval(()=>spawnOne(), SPAWN_INTERVAL);
+
+// ---------- Player damage when enemy close ----------
+function enemyAttackPlayer(e, dt) {
+  // when enemy reaches within nearDistance, apply damage over time
+  const nearDistance = 0.7 * e.size; // scaled by enemy size
+  const dx = player.x - e.x;
+  const dy = player.y - e.y;
+  const dist = Math.hypot(dx,dy);
+  if (dist <= nearDistance + 0.18) {
+    // apply damage per second based on enemy.damage
+    const perSec = e.damage;
+    const amount = perSec * dt;
+    player.hp -= amount;
+    if (amount > 0 && !isMuted) playPlayerHitSound();
+    if (player.hp <= 0) {
+      player.hp = 0;
+      player.alive = false;
+    }
+  }
+}
+
+// ---------- HUD update ----------
+const scoreEl = document.getElementById('score');
+const hpValEl = document.getElementById('hpVal');
+
+function updateHUD() {
+  scoreEl.textContent = 'Score: ' + Math.floor(score);
+  hpValEl.textContent = Math.max(0, Math.floor(player.hp));
+}
+
+// ---------- Simple world boundaries (no walls here, open arena) ----------
+const WORLD = { w: 26, h: 22 };
+
+// ---------- Game Loop ----------
+let last = performance.now();
+
+function gameLoop(now) {
+  const dt = Math.min(0.06, (now - last) / 1000); // seconds (cap)
+  last = now;
+  update(dt);
+  render(dt);
+  requestAnimationFrame(gameLoop);
+}
+
+// Movement & enemy updates
+function update(dt) {
+  if (!player.alive) {
+    // allow restart on R
+    if (keys['r']) {
+      resetGame();
+    }
+    return;
+  }
+
+  // rotation with A/D
+  const turnSpeed = 2.2; // rad/s
+  if (keys['a']) player.dir -= turnSpeed * dt;
+  if (keys['d']) player.dir += turnSpeed * dt;
+
+  // forward/back with W/S
+  let move = 0;
+  if (keys['w']) move += 1;
+  if (keys['s']) move -= 1;
+  if (move !== 0) {
+    const nx = player.x + Math.cos(player.dir) * player.speed * move * dt;
+    const ny = player.y + Math.sin(player.dir) * player.speed * move * dt;
+    // clamp inside world bounds roughly
+    player.x = Math.max(0.4, Math.min(WORLD.w - 0.4, nx));
+    player.y = Math.max(0.4, Math.min(WORLD.h - 0.4, ny));
+  }
+
+  // enemies move toward player
+  for (let e of enemies) {
+    if (!e.alive) continue;
+    const dx = player.x - e.x;
+    const dy = player.y - e.y;
+    const dist = Math.hypot(dx,dy);
+    if (dist > 0.001) {
+      e.x += (dx / dist) * e.speed * dt;
+      e.y += (dy / dist) * e.speed * dt;
+    }
+    enemyAttackPlayer(e, dt);
+  }
+
+  // remove dead enemies after a short fade (we set alive=false and keep them to show death)
+  enemies = enemies.filter(e => {
+    // we'll keep corpse for a short visual, but if dead and flagged remove
+    if (!e.alive && e._removed) return false;
+    return true;
+  });
+
+  // gun recoil/muzzle decay
+  gun.recoil = Math.max(0, gun.recoil - 6 * dt);
+  gun.muzzleFlash = Math.max(0, gun.muzzleFlash - 12 * dt);
+
+  updateHUD();
+}
+
+// ---------- Render ----------
+function render(dt) {
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0,0,W,H);
+
+  // draw background / sky & floor separation (simple)
+  ctx.fillStyle = '#222';
+  ctx.fillRect(0,0,W,H*0.5);
+  ctx.fillStyle = '#444';
+  ctx.fillRect(0,H*0.5,W,H*0.5);
+
+  // draw top-down mini world in the left-bottom corner (optional small minimap)
+  const mini = { x: 12, y: H - 12 - 140, w: 180, h: 140 };
+  // background
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(mini.x-6, mini.y-6, mini.w+12, mini.h+12);
+  // grid
+  const cellPx = Math.min(mini.w / WORLD.w, mini.h / WORLD.h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let gx=0; gx<=WORLD.w; gx++) {
+    const sx = mini.x + gx * cellPx;
+    ctx.beginPath(); ctx.moveTo(sx, mini.y); ctx.lineTo(sx, mini.y + WORLD.h * cellPx); ctx.stroke();
+  }
+  for (let gy=0; gy<=WORLD.h; gy++) {
+    const sy = mini.y + gy * cellPx;
+    ctx.beginPath(); ctx.moveTo(mini.x, sy); ctx.lineTo(mini.x + WORLD.w * cellPx, sy); ctx.stroke();
+  }
+  // draw spawn points on minimap
+  for (const sp of SPAWN_POINTS) {
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(mini.x + sp.x*cellPx - 3, mini.y + sp.y*cellPx - 3, 6, 6);
+  }
+
+  // draw enemies in 3D screen projection style (billboard)
+  for (let e of enemies) {
+    // compute relative pos to player
+    const dx = e.x - player.x;
+    const dy = e.y - player.y;
+    const dist = Math.hypot(dx,dy);
+    // angle to enemy relative to player dir
+    let ang = Math.atan2(dy, dx) - player.dir;
+    while (ang < -Math.PI) ang += Math.PI*2;
+    while (ang >  Math.PI) ang -= Math.PI*2;
+
+    // only draw if inside FOV (slightly wider to allow peripheral)
+    if (Math.abs(ang) <= player.fov/1.6) {
+      // screen X using perspective mapping
+      const ndc = ang / (player.fov/2); // -1..1
+      const screenX = (0.5 + ndc*0.5) * W;
+      // size inversely proportional to distance
+      const perceived = (e.size / Math.max(dist,0.3)) * (W*0.6);
+      const size = clamp(perceived, 8, 420);
+
+      // shadow / distance shading
+      const shade = clamp(1 - (dist / 20), 0.15, 1.0);
+      ctx.save();
+      ctx.globalAlpha = e.alive ? 1.0 : 0.6;
+      // draw circle as billboard
+      ctx.beginPath();
+      ctx.fillStyle = shadeColor(e.color, -30 * (1 - shade));
+      ctx.arc(screenX, H/2, size/2, 0, Math.PI*2);
+      ctx.fill();
+      ctx.closePath();
+
+      // health bar above
+      const hbW = Math.max(18, size * 0.7);
+      const hbH = 6;
+      // background
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(screenX - hbW/2, H/2 - size/2 - 14, hbW, hbH);
+      // hp fill
+      const hpFrac = clamp(e.hp / e.maxHp, 0, 1);
+      ctx.fillStyle = 'rgba(0,0,0,0.0)';
+      ctx.fillRect(screenX - hbW/2 + 1, H/2 - size/2 - 13, (hbW-2) * hpFrac, hbH-2);
+      // colored overlay
+      ctx.fillStyle = e.color;
+      ctx.fillRect(screenX - hbW/2 + 1, H/2 - size/2 - 13, (hbW-2) * hpFrac, hbH-2);
+
+      ctx.restore();
+    }
+  }
+
+  // muzzle flash & gun draw (overlay)
+  drawGun();
+
+  // draw minimap player marker
+  // player dot
+  ctx.fillStyle = '#fff';
+  const px = mini.x + player.x * cellPx;
+  const py = mini.y + player.y * cellPx;
+  ctx.beginPath(); ctx.arc(px, py, 4, 0, Math.PI*2); ctx.fill();
+  // facing direction
+  ctx.strokeStyle = '#fff';
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.lineTo(px + Math.cos(player.dir) * 12, py + Math.sin(player.dir) * 12);
+  ctx.stroke();
+
+  // if dead overlay
+  if (!player.alive) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#f55';
+    ctx.font = 'bold 36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU DIED', W/2, H/2 - 12);
+    ctx.font = '16px sans-serif';
+    ctx.fillText('Press R to restart', W/2, H/2 + 20);
+  }
+}
+
+// draw gun at bottom center with simple recoil and muzzle flash
+function drawGun() {
+  const W = canvas.width, H = canvas.height;
+  // base gun rectangle
+  const baseWidth = Math.min(420, W * 0.36);
+  const baseHeight = Math.min(180, H * 0.38);
+  // recoil causes upward movement and scale
+  const recoilFactor = gun.recoil; // 0..1
+  const recoilY = recoilFactor * 32;
+  const x = W/2 - baseWidth/2;
+  const y = H - baseHeight - 6 - recoilY;
+
+  // gun body (simple)
+  ctx.save();
+  ctx.fillStyle = '#2c2c2c';
+  roundRect(ctx, x, y, baseWidth, baseHeight * 0.66, 16, true, false);
+  // barrel
+  const barrelW = baseWidth * 0.42;
+  const barrelH = baseHeight * 0.14;
+  ctx.fillStyle = '#0f0f0f';
+  roundRect(ctx, W/2 - barrelW/2, y - barrelH/2, barrelW, barrelH, 8, true, false);
+
+  // cloth/trim
+  ctx.fillStyle = '#555';
+  ctx.fillRect(x + 12, y + baseHeight*0.12, baseWidth - 24, baseHeight*0.08);
+
+  // muzzle flash (if shooting recently)
+  if (gun.muzzleFlash > 0.02) {
+    ctx.globalCompositeOperation = 'lighter';
+    const mf = gun.muzzleFlash;
+    const flashW = clamp(30 + Math.random()*40 * mf, 10, 120);
+    const flashH = clamp(10 + Math.random()*60 * mf, 6, 160);
+    const fx = W/2 + barrelW/2 + 8;
+    const fy = y + barrelH/2;
+    // radial flash
+    const g = ctx.createRadialGradient(fx, fy, 2, fx, fy, flashW);
+    g.addColorStop(0, 'rgba(255,250,200,' + (0.9*mf) + ')');
+    g.addColorStop(0.4, 'rgba(255,160,40,' + (0.55*mf) + ')');
+    g.addColorStop(1, 'rgba(255,40,0,0.0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(fx, fy, flashW, flashH, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  ctx.restore();
+}
+
+// ---------- Helpers ----------
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+function shadeColor(hex, percent) {
+  // simple lighten/darken (percent negative darkens)
+  const c = hex.replace('#','');
+  const r = parseInt(c.substring(0,2),16);
+  const g = parseInt(c.substring(2,4),16);
+  const b = parseInt(c.substring(4,6),16);
+  const f = n => clamp(Math.round(n * (100 + percent) / 100), 0, 255);
+  return '#' + [f(r), f(g), f(b)].map(n => n.toString(16).padStart(2,'0')).join('');
+}
+
+// rounded rect helper
+function roundRect(ctx, x, y, w, h, r, fill, stroke) {
+  if (typeof r === 'number') r = {tl:r, tr:r, br:r, bl:r};
+  ctx.beginPath();
+  ctx.moveTo(x + r.tl, y);
+  ctx.lineTo(x + w - r.tr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r.tr);
+  ctx.lineTo(x + w, y + h - r.br);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r.br, y + h);
+  ctx.lineTo(x + r.bl, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r.bl);
+  ctx.lineTo(x, y + r.tl);
+  ctx.quadraticCurveTo(x, y, x + r.tl, y);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke) ctx.stroke();
+}
+
+// ---------- Restart ----------
+function resetGame() {
+  player = { ...player, x: 5.0, y: 5.0, dir: 0, hp: 100, alive: true };
+  enemies = [];
+  score = 0;
+  lastSpawnTime = performance.now();
+  spawnOne();
+}
+
+// ---------- Utility: remove dead bodies after short time ----------
+(function cleanupLoop(){
+  setInterval(()=>{
+    for (let i = enemies.length -1; i>=0; i--) {
+      const e = enemies[i];
+      if (!e.alive) {
+        // mark for removal after 1.2s
+        if (!e._deadAt) e._deadAt = performance.now();
+        if (performance.now() - e._deadAt > 1200) {
+          enemies.splice(i,1);
+        }
+      }
+    }
+  }, 300);
+})();
+
+// ---------- Start loop ----------
+requestAnimationFrame(gameLoop);
+
+// ---------- Auto-spawn if none for a while ----------
+(function autoSpawnCheck(){
+  setInterval(()=>{
+    // ensure there's at least 1-2 enemies
+    if (enemies.filter(e=>e.alive).length < 1) spawnOne();
+  }, 3600);
+})();
+
+</script>
+</body>
+</html>
